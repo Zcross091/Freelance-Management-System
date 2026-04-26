@@ -1,1 +1,4 @@
-
+.env
+hostel_business.db
+__pycache__/
+*.pyc
