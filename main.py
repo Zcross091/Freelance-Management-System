@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 WORKER_CHANNEL_ID = 1234567890  # Replace with actual Worker Channel ID
-ADMIN_ID = 1234567890           # Replace with YOUR Discord User ID
+ADMIN_ID = 1234567890           # Replace with YOUR Discord User ID (Yahya)
 
 # --- DATABASE LAYER ---
 def init_db():
@@ -22,6 +22,7 @@ def init_db():
             description TEXT,
             deadline TEXT,
             total_price REAL,
+            page_count INTEGER DEFAULT 0,
             worker_name TEXT,
             worker_id INTEGER,
             message_id INTEGER,
@@ -29,6 +30,12 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # This line ensures existing databases get the page_count column if they don't have it
+    try:
+        cursor.execute('ALTER TABLE assignments ADD COLUMN page_count INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass # Column already exists
+        
     conn.commit()
     conn.close()
 
@@ -68,7 +75,6 @@ class IntakeForm(ui.Modal, title='Hostel Assignment Intake'):
                 sent_msg = await channel.send(embed=embed)
                 await sent_msg.add_reaction("👍")
                 
-                # Update DB with message ID for Bot B and C to reference
                 conn = sqlite3.connect('hostel_business.db')
                 cursor = conn.cursor()
                 cursor.execute('UPDATE assignments SET message_id = ? WHERE ticket_id = ?', (sent_msg.id, ticket_id))
@@ -95,7 +101,6 @@ class HostelBot(discord.Client):
         init_db()
         print(f'Logged in as {self.user}')
 
-    # --- BOT B: THE DISPATCHER (CLAIMING) ---
     async def on_raw_reaction_add(self, payload):
         if payload.user_id == self.user.id: return 
 
@@ -105,33 +110,29 @@ class HostelBot(discord.Client):
             cursor.execute('SELECT ticket_id, status FROM assignments WHERE message_id = ?', (payload.message_id,))
             result = cursor.fetchone()
 
-            if result:
-                ticket_id, status = result
-                # Race condition check: Only claim if it's still OPEN
-                if status == 'OPEN':
-                    cursor.execute('''
-                        UPDATE assignments 
-                        SET status = "CLAIMED", worker_id = ?, worker_name = ? 
-                        WHERE ticket_id = ?
-                    ''', (payload.user_id, payload.member.name, ticket_id))
-                    conn.commit()
-                    
-                    channel = self.get_channel(payload.channel_id)
-                    await channel.send(f"💼 **Ticket #{ticket_id}** assigned to {payload.member.mention}!")
+            if result and result[1] == 'OPEN':
+                cursor.execute('''
+                    UPDATE assignments 
+                    SET status = "CLAIMED", worker_id = ?, worker_name = ? 
+                    WHERE ticket_id = ?
+                ''', (payload.user_id, payload.member.name, result[0]))
+                conn.commit()
                 
+                channel = self.get_channel(payload.channel_id)
+                await channel.send(f"💼 **Ticket #{result[0]}** assigned to {payload.member.mention}!")
             conn.close()
 
 bot = HostelBot()
 
-# --- BOT C: COMMANDS & TRACKING ---
+# --- COMMANDS ---
 
 @bot.tree.command(name="new_order", description="The Guy: Start a new assignment ticket")
 async def new_order(interaction: discord.Interaction):
     await interaction.response.send_modal(IntakeForm())
 
-@bot.tree.command(name="complete", description="The Guy: Mark ticket as paid and clean channel")
-@app_commands.describe(ticket_id="The ID of the ticket to close")
-async def complete(interaction: discord.Interaction, ticket_id: int):
+@bot.tree.command(name="complete", description="The Guy: Mark as PAID and log pages written")
+@app_commands.describe(ticket_id="The ID of the ticket", pages="How many pages were written?")
+async def complete(interaction: discord.Interaction, ticket_id: int, pages: int):
     conn = sqlite3.connect('hostel_business.db')
     cursor = conn.cursor()
     
@@ -142,54 +143,60 @@ async def complete(interaction: discord.Interaction, ticket_id: int):
         conn.close()
         return await interaction.response.send_message(f"❓ Ticket #{ticket_id} not found.", ephemeral=True)
     
-    status, msg_id = result
-    if status == 'PAID':
+    if result[0] == 'PAID':
         conn.close()
         return await interaction.response.send_message(f"✅ Ticket #{ticket_id} is already paid.", ephemeral=True)
 
-    # 1. Update Database
-    cursor.execute('UPDATE assignments SET status = "PAID" WHERE ticket_id = ?', (ticket_id,))
+    # 1. Update Database with status and page count
+    cursor.execute('UPDATE assignments SET status = "PAID", page_count = ? WHERE ticket_id = ?', (pages, ticket_id))
     conn.commit()
     conn.close()
     
-    # 2. Delete Message from Worker Channel (Cleanup)
-    cleanup_note = ""
+    # 2. Cleanup Channel
     channel = interaction.guild.get_channel(WORKER_CHANNEL_ID)
-    if channel and msg_id:
+    if channel and result[1]:
         try:
-            msg_to_delete = await channel.fetch_message(msg_id)
-            await msg_to_delete.delete()
-            cleanup_note = "and channel cleared."
+            msg = await channel.fetch_message(result[1])
+            await msg.delete()
         except:
-            cleanup_note = "(Job message was already manually deleted or not found)."
+            pass
 
-    await interaction.response.send_message(f"💰 Ticket #{ticket_id} marked as PAID {cleanup_note}", ephemeral=True)
+    await interaction.response.send_message(f"💰 Ticket #{ticket_id} closed. {pages} pages logged (₹{pages} commission for Yahya).", ephemeral=True)
 
-@bot.tree.command(name="payouts", description="CFO View: View total earnings and splits")
+@bot.tree.command(name="payouts", description="CFO View: Financial records and page-count splits")
 async def payouts(interaction: discord.Interaction):
     if interaction.user.id != ADMIN_ID:
         return await interaction.response.send_message("🚫 Unauthorized.", ephemeral=True)
 
     conn = sqlite3.connect('hostel_business.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT worker_name, SUM(total_price) FROM assignments WHERE status = 'PAID' GROUP BY worker_name")
+    
+    # Calculate Yahya's total commission (Sum of pages * 1)
+    cursor.execute("SELECT SUM(page_count) FROM assignments WHERE status = 'PAID'")
+    yahya_total = cursor.fetchone()[0] or 0
+
+    # Calculate Worker splits
+    cursor.execute("SELECT worker_name, SUM(total_price), SUM(page_count) FROM assignments WHERE status = 'PAID' GROUP BY worker_name")
     rows = cursor.fetchall()
     
-    embed = discord.Embed(title="📊 Financial Summary (PAID Jobs Only)", color=discord.Color.gold())
-    total_revenue = 0
+    embed = discord.Embed(title="📊 Payout Summary", color=discord.Color.gold())
+    total_business_rev = 0
     
     if not rows:
-        embed.description = "No completed payments found."
+        embed.description = "No completed payments recorded."
     else:
         for row in rows:
-            name, total = row
-            total_revenue += total
-            worker_cut = total * 0.9
-            embed.add_field(name=f"Worker: {name}", value=f"Revenue: ₹{total}\n**Pay Worker: ₹{worker_cut}**", inline=False)
+            name, total_rev, pages = row
+            total_business_rev += total_rev
+            # Worker gets Total Revenue - Yahya's Page Cut
+            worker_pay = total_rev - (pages * 1)
+            embed.add_field(
+                name=f"Worker: {name}", 
+                value=f"Total: ₹{total_rev} | Pages: {pages}\n**Pay Worker: ₹{worker_pay}**", 
+                inline=False
+            )
     
-    your_cut = total_revenue * 0.1
-    embed.set_footer(text=f"Total Rev: ₹{total_revenue} | Your 10%: ₹{your_cut}")
-    
+    embed.set_footer(text=f"Total Revenue: ₹{total_business_rev} | Yahya's Total (₹1/page): ₹{yahya_total}")
     await interaction.response.send_message(embed=embed)
     conn.close()
 
