@@ -32,7 +32,7 @@ Workers claim jobs by reacting with 👍.
 *   **Logic:** The system performs a database check at the millisecond of the reaction.
 *   **Security:** If two workers react simultaneously, the database only authorizes the first one, preventing double-assignments.
 
-### ### 3. The "CFO" Ledger (Yahya's Commission)
+### ### 3. The "CFO" Ledger (Admin's Commission)
 The system uses a unique **Page-Based Commission Model**:
 *   **Tracker:** Automatically calculates management fees based on a ₹1/page rate.
 *   **Live Balance:** `/payouts` shows exactly what is currently owed to the administrator.
